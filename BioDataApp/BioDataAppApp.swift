@@ -20,4 +20,4 @@ struct BioDataAppApp: App {
     }
 }
 
-print("hi")
+
