@@ -18,9 +18,11 @@ Scoring approach:
   Mood correlations shift metric weights over time to personalise.
 """
 
+import csv
+import os
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List, Tuple, Any
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -457,48 +459,206 @@ class HealthScoreModel:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CSV training data loader (e.g. TrainingDataV1.csv)
+# Expected columns (case-insensitive, flexible names):
+#   Daily: date (optional), steps, exercise_min|exercise_minutes|exercise,
+#          sleep_hours|sleep, resting_hr|rhr, mood
+#   Profile (optional, from first row): height_cm|height, weight_kg|weight, gender, age
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _norm_key(s: str) -> str:
+    return s.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+# Map possible CSV column names -> our internal name
+COLUMN_ALIASES = {
+    "steps": ["steps", "step_count"],
+    "exercise_min": ["exercise_min", "exercise_minutes", "exercise", "exercise_minutes_per_day"],
+    "sleep_hours": ["sleep_hours", "sleep", "sleep_hrs", "sleep_hours_per_night"],
+    "resting_hr": ["resting_hr", "rhr", "resting_heart_rate", "resting_heart_rate_bpm", "heart_rate_rest"],
+    "mood": ["mood", "mood_score", "mood_0_10"],
+    "date": ["date", "day", "timestamp"],
+    "height_cm": ["height_cm", "height", "height_cm"],
+    "weight_kg": ["weight_kg", "weight", "weight_kg"],
+    "gender": ["gender", "sex"],
+    "age": ["age", "age_years"],
+}
+
+
+def _find_column(row: dict, internal_name: str) -> Optional[str]:
+    """Return CSV column key that maps to internal_name, or None."""
+    aliases = COLUMN_ALIASES.get(internal_name, [internal_name])
+    norm_row = {_norm_key(k): k for k in row.keys()}
+    for a in aliases:
+        if _norm_key(a) in norm_row:
+            return norm_row[_norm_key(a)]
+    return None
+
+
+def _safe_float(val: Any, default: Optional[float] = None) -> Optional[float]:
+    if val is None or (isinstance(val, str) and val.strip() == ""):
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def load_training_csv(
+    path: str,
+) -> Tuple[Optional[dict], List[dict]]:
+    """
+    Load TrainingDataV1-style CSV. Returns (profile, daily_rows).
+    profile: dict with height_cm, weight_kg, gender, age if present in CSV (e.g. first row);
+             None if not in file (caller must provide profile).
+    daily_rows: list of dicts with keys steps, exercise_min, sleep_hours, resting_hr (optional), mood, and optionally date.
+    """
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"CSV not found: {path}")
+
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    if not rows:
+        return None, []
+
+    first = rows[0]
+    profile = None
+    profile_keys = ["height_cm", "weight_kg", "gender", "age"]
+    if any(_find_column(first, k) for k in profile_keys):
+        h_col = _find_column(first, "height_cm")
+        w_col = _find_column(first, "weight_kg")
+        g_col = _find_column(first, "gender")
+        a_col = _find_column(first, "age")
+        h = _safe_float(first.get(h_col)) if h_col else None
+        w = _safe_float(first.get(w_col)) if w_col else None
+        g = first.get(g_col) if g_col else None
+        a = _safe_float(first.get(a_col)) if a_col else None
+        if g is not None and isinstance(g, str):
+            g = g.strip().lower()
+        if all(x is not None for x in (h, w, g, a)):
+            profile = {"height_cm": h, "weight_kg": w, "gender": g, "age": int(a)}
+
+    daily_rows = []
+    for r in rows:
+        s_col = _find_column(r, "steps")
+        e_col = _find_column(r, "exercise_min")
+        sl_col = _find_column(r, "sleep_hours")
+        rhr_col = _find_column(r, "resting_hr")
+        m_col = _find_column(r, "mood")
+        d_col = _find_column(r, "date")
+
+        steps = _safe_float(r.get(s_col)) if s_col else None
+        exercise_min = _safe_float(r.get(e_col)) if e_col else None
+        sleep_hours = _safe_float(r.get(sl_col)) if sl_col else None
+        resting_hr = _safe_float(r.get(rhr_col)) if rhr_col else None
+        mood = _safe_float(r.get(m_col)) if m_col else None
+
+        if steps is None and exercise_min is None and sleep_hours is None and mood is None:
+            continue
+        steps = steps if steps is not None else 0.0
+        exercise_min = exercise_min if exercise_min is not None else 0.0
+        sleep_hours = sleep_hours if sleep_hours is not None else 7.0
+        mood = mood if mood is not None else 5.0
+
+        daily_rows.append({
+            "date": r.get(d_col) if d_col else None,
+            "steps": float(steps),
+            "exercise_min": float(exercise_min),
+            "sleep_hours": float(sleep_hours),
+            "resting_hr": resting_hr,
+            "mood": float(mood),
+        })
+
+    return profile, daily_rows
+
+
+def run_from_csv(
+    csv_path: str,
+    profile_override: Optional[dict] = None,
+) -> Tuple["HealthScoreModel", List[ScoreResult]]:
+    """
+    Load CSV, create model (from CSV profile or profile_override), log each day in order.
+    Returns (model, list of ScoreResult for each day).
+    profile_override: optional dict with height_cm, weight_kg, gender, age (overrides CSV profile).
+    """
+    profile, daily_rows = load_training_csv(csv_path)
+    if profile_override is not None:
+        profile = profile_override
+    if profile is None:
+        raise ValueError(
+            "No profile in CSV and no profile_override. CSV must have height_cm, weight_kg, gender, age in first row, "
+            "or pass profile_override={'height_cm': ..., 'weight_kg': ..., 'gender': ..., 'age': ...}."
+        )
+    model = HealthScoreModel(
+        height_cm=profile["height_cm"],
+        weight_kg=profile["weight_kg"],
+        gender=profile["gender"],
+        age=int(profile["age"]),
+    )
+    results = []
+    for row in daily_rows:
+        r = model.log_day(
+            steps=row["steps"],
+            exercise_minutes=row["exercise_min"],
+            sleep_hours=row["sleep_hours"],
+            mood=row["mood"],
+            resting_hr=row.get("resting_hr"),
+        )
+        results.append(r)
+    return model, results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Demo — real RHR data, constant other metrics
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import sys
+
+    # Run from CSV if path given: python health_score_model.py [path/to/TrainingDataV1.csv]
+    if len(sys.argv) >= 2 and sys.argv[1].endswith(".csv"):
+        csv_path = os.path.expanduser(sys.argv[1])
+        profile_override = None  # or pass via env / second arg if needed
+        print(f"Loading: {csv_path}")
+        model, results = run_from_csv(csv_path, profile_override=profile_override)
+        print(f"Profile: {model.gender}, {model.height}cm, {model.weight}kg, age {model.age}  |  BMR: {model.bmr:.0f} kcal")
+        print(f"Days loaded: {len(results)}\n")
+        print(f"{'Day':<5} {'Score':>6} {'Raw':>6} {'Baseline':<9}  Steps  Ex(min)  Sleep  RHR    Mood")
+        print("-" * 65)
+        for i, r in enumerate(results, 1):
+            e = model.history[i - 1]
+            rhr_s = f"{e.resting_hr:.0f}" if e.resting_hr is not None else "—"
+            print(
+                f"{i:<5} {r.score:>5.1f}  {r.score_raw:>5.1f}  {r.baseline_source:<9}  "
+                f"{e.steps:>5.0f}  {e.exercise_min:>6.1f}  {e.sleep_hours:>5.1f}  {rhr_s:>4}  {e.mood:>4.1f}"
+            )
+        if results:
+            scores = model.score_history
+            print(f"\n── Summary ──  Score range: {min(scores):.1f}–{max(scores):.1f}  (mean {np.mean(scores):.1f})")
+        sys.exit(0)
+
+    # Original demo: Excel RHR data
     import openpyxl
 
-    # Male, 5'8" = 172.7cm, 150lbs = 68kg, age 18
     model = HealthScoreModel(height_cm=172.7, weight_kg=68.0, gender="male", age=18)
-
-    wb = openpyxl.load_workbook('/Users/nicholaske/Downloads/SampleRHR.xlsx')
+    wb = openpyxl.load_workbook(os.path.expanduser("~/Downloads/SampleRHR.xlsx"))
     rhr_data = [(row[0][:10], row[3]) for row in wb.active.iter_rows(values_only=True)]
 
-    CONST_STEPS    = 8500
-    CONST_EXERCISE = 35
-    CONST_SLEEP    = 7.5
-    CONST_MOOD     = 7.0
-
+    CONST_STEPS, CONST_EXERCISE, CONST_SLEEP, CONST_MOOD = 8500, 35, 7.5, 7.0
     print(f"User: Male, 5'8\", 150 lbs, age 18  |  BMR: {model.bmr:.0f} kcal")
     print(f"Constants: steps={CONST_STEPS}, exercise={CONST_EXERCISE}min, sleep={CONST_SLEEP}h, mood={CONST_MOOD}\n")
     print(f"{'Day':<4} {'Date':<12} {'RHR':>4} {'RHR Abs':>8} {'Score(raw)':>10} {'Score(smooth)':>13} {'Src':<9}")
     print("-" * 70)
-
     for i, (date, rhr) in enumerate(rhr_data):
         result = model.log_day(
-            steps           = CONST_STEPS,
-            exercise_minutes= CONST_EXERCISE,
-            sleep_hours     = CONST_SLEEP,
-            mood            = CONST_MOOD,
-            resting_hr      = rhr,
+            steps=CONST_STEPS, exercise_minutes=CONST_EXERCISE,
+            sleep_hours=CONST_SLEEP, mood=CONST_MOOD, resting_hr=rhr,
         )
         rhr_abs = result.metric_scores.get("resting_hr", "-")
-        print(
-            f"{i+1:<4} {date:<12} {rhr:>4}  "
-            f"{rhr_abs:>7.1f}  "
-            f"{result.score_raw:>9.1f}  "
-            f"{result.score:>12.1f}  "
-            f"{result.baseline_source}"
-        )
-
-    print("\n── Summary ─────────────────────────────────────────────")
-    rhrs   = [r[1] for r in rhr_data]
+        print(f"{i+1:<4} {date:<12} {rhr:>4}  {rhr_abs:>7.1f}  {result.score_raw:>9.1f}  {result.score:>12.1f}  {result.baseline_source}")
+    rhrs = [x[1] for x in rhr_data]
     scores = model.score_history
-    print(f"  RHR range    : {min(rhrs)}–{max(rhrs)} bpm  (mean {np.mean(rhrs):.1f})")
-    print(f"  Score range  : {min(scores):.1f}–{max(scores):.1f}  (mean {np.mean(scores):.1f})")
-    print(f"  Score swing  : {max(scores)-min(scores):.1f} pts  (was 16.0 pts before fix)")
+    print(f"\n── Summary ──  RHR: {min(rhrs)}–{max(rhrs)} bpm  |  Score: {min(scores):.1f}–{max(scores):.1f}")
