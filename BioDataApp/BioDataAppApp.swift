@@ -10,7 +10,7 @@ import SwiftUI
 @main
 struct BioDataAppApp: App {
     init() {
-            HealthBridge.shared.fetchHistory(daysBack: 90)
+        //HealthBridge.shared.fetchHistory(daysBack: 90)
             HealthBridge.shared.setup()
         }
     var body: some Scene {
