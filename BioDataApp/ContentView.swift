@@ -33,19 +33,71 @@ struct DayScore: Identifiable {
     let restingHR: Int
     let exerciseMinutes: Int
     let sleepHours: Double
-    let mood: Int  // 1–5, 0 = not set
+    let mood: Int
 }
 
-func computeScore(steps: Int, restingHR: Int, exerciseMinutes: Int, sleepHours: Double) -> Double {
-    let stepsScore    = min(Double(steps) / 10_000.0, 1.0) * 25.0
-    let hrScore: Double = {
-        if restingHR <= 0 { return 0 }
-        let clamped = max(50.0, min(Double(restingHR), 90.0))
-        return (1.0 - (clamped - 50.0) / 40.0) * 25.0
-    }()
-    let exerciseScore = min(Double(exerciseMinutes) / 60.0, 1.0) * 25.0
-    let sleepScore    = min(max((sleepHours - 4.0) / 4.0, 0.0), 1.0) * 25.0
-    return stepsScore + hrScore + exerciseScore + sleepScore
+// ── API config — change IP to your Mac's local WiFi address ──
+let kAPIBase = "http://10.144.131.189:5001"
+let kUserID  = "user_1"   // change per user if needed
+
+// User profile sent with every /score call — update to match real user
+let kUserProfile: [String: Any] = [
+    "height_cm": 175,
+    "weight_kg": 70,
+    "gender":    "male",
+    "age":       25
+]
+
+// ── Fetch score from Python model via POST /score ──────────────
+func fetchAPIScore(
+    steps: Int,
+    restingHR: Int,
+    exerciseMinutes: Int,
+    sleepHours: Double,
+    mood: Int,
+    completion: @escaping (Double?) -> Void
+) {
+    print("1 fetch")
+    guard let url = URL(string: "\(kAPIBase)/score") else { completion(nil); return }
+
+    var body: [String: Any] = [
+        "user_id":          kUserID,
+        "profile":          kUserProfile,
+        "steps":            steps,
+        "exercise_minutes": exerciseMinutes,
+        "sleep_hours":      sleepHours,
+        "mood":             mood
+    ]
+    if restingHR > 0 { body["resting_hr"] = restingHR }
+    print("2 fetch")
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 6
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+    print("3 fetch")
+    URLSession.shared.dataTask(with: req) { data, _, error in
+        if let error = error {
+            print("❌ API network error: \(error.localizedDescription)")
+            completion(nil); return
+        }
+        guard let data = data else {
+            print("❌ API error: no data")
+            completion(nil); return
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            print("❌ API error: bad JSON — \(String(data: data, encoding: .utf8) ?? "?")")
+            completion(nil); return
+        }
+        guard let score = json["score"] as? Double else {
+            print("❌ API error: missing score key — \(json)")
+            completion(nil); return
+        }
+        print("✅ API score received: \(score)")
+        completion(score)
+    }.resume()
+    print("4 fetch")
 }
 
 func scoreColor(_ score: Double) -> Color {
@@ -53,7 +105,7 @@ func scoreColor(_ score: Double) -> Color {
     case 75...: return Color(red: 0.20, green: 0.78, blue: 0.45)
     case 50...: return Color(red: 0.79, green: 0.66, blue: 0.30)
     default:    return Color(red: 0.85, green: 0.35, blue: 0.35)
-}
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -126,6 +178,7 @@ struct HomeView: View {
     @State private var todayScore: Double = 0
     @State private var selectedMood: Int  = 0
     @State private var history: [DayScore] = []
+    @State private var isLoadingScore = false
 
     private let moodOptions: [(Int, String, String)] = [
         (1, "Terrible", "1"),
@@ -157,7 +210,14 @@ struct HomeView: View {
                     .padding(.top, 24)
 
                     // ── Score Ring ──────────────────────────────
-                    ScoreRingView(score: todayScore)
+                    ZStack {
+                        ScoreRingView(score: todayScore)
+                        if isLoadingScore {
+                            ProgressView()
+                                .tint(Color(white: 0.5))
+                                .offset(y: 52)
+                        }
+                    }
 
                     // ── Score Chart ─────────────────────────────
                     if history.count > 1 {
@@ -248,16 +308,17 @@ struct HomeView: View {
         guard lines.count > 1 else { return }
 
         let headers  = lines[0].components(separatedBy: ",")
-        let dateIdx  = headers.firstIndex(of: "date")                  ?? 0
-        let stepsIdx = headers.firstIndex(of: "steps")                 ?? 1
+        let dateIdx  = headers.firstIndex(of: "date")                   ?? 0
+        let stepsIdx = headers.firstIndex(of: "steps")                  ?? 1
         let hrIdx    = headers.firstIndex(of: "resting_heart_rate_bpm") ?? 2
-        let exIdx    = headers.firstIndex(of: "exercise_minutes")      ?? 3
-        let sleepIdx = headers.firstIndex(of: "sleep_hours")           ?? 4
+        let exIdx    = headers.firstIndex(of: "exercise_minutes")       ?? 3
+        let sleepIdx = headers.firstIndex(of: "sleep_hours")            ?? 4
         let moodIdx  = headers.firstIndex(of: "mood")
 
         let dateFmt = DateFormatter(); dateFmt.dateFormat = "yyyy-MM-dd"
 
-        history = lines.dropFirst().compactMap { line -> DayScore? in
+        // Parse CSV rows — score starts at 0, API will fill it in
+        let parsed = lines.dropFirst().compactMap { line -> DayScore? in
             let cols = line.components(separatedBy: ",")
             guard cols.indices.contains(dateIdx),
                   let date = dateFmt.date(from: cols[dateIdx]) else { return nil }
@@ -266,13 +327,57 @@ struct HomeView: View {
             let exercise = Int(cols[safe: exIdx] ?? "")       ?? 0
             let sleep    = Double(cols[safe: sleepIdx] ?? "") ?? 0
             let mood     = moodIdx.flatMap { Int(cols[safe: $0] ?? "") } ?? 0
-            let score    = computeScore(steps: steps, restingHR: hr, exerciseMinutes: exercise, sleepHours: sleep)
-            return DayScore(date: date, score: score, steps: steps, restingHR: hr,
+            // score = 0 as placeholder; API call below will replace it
+            return DayScore(date: date, score: 0, steps: steps, restingHR: hr,
                             exerciseMinutes: exercise, sleepHours: sleep, mood: mood)
         }
         .sorted { $0.date < $1.date }
 
-        todayScore = history.last?.score ?? 0
+        history = parsed
+        todayScore = 0
+
+        // Fetch API scores for every row, update history and todayScore as results arrive
+        isLoadingScore = true
+        let group = DispatchGroup()
+
+        var updatedHistory = parsed
+
+        for (i, day) in parsed.enumerated() {
+            group.enter()
+            fetchAPIScore(
+                steps:           day.steps,
+                restingHR:       day.restingHR,
+                exerciseMinutes: day.exerciseMinutes,
+                sleepHours:      day.sleepHours,
+                mood:            day.mood > 0 ? day.mood : 3
+            ) { apiScore in
+                guard let apiScore else {
+                    print("⚠️ API returned nil for row \(i) — score stays 0")
+                    group.leave(); return
+                }
+                let updated = DayScore(
+                    date: day.date, score: apiScore,
+                    steps: day.steps, restingHR: day.restingHR,
+                    exerciseMinutes: day.exerciseMinutes,
+                    sleepHours: day.sleepHours, mood: day.mood
+                )
+                DispatchQueue.main.async {
+                    updatedHistory[i] = updated
+                    self.history = updatedHistory
+                    // Keep todayScore in sync with the last (most recent) entry
+                    if i == parsed.count - 1 {
+                        self.todayScore = apiScore
+                    }
+                }
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) {
+            self.history = updatedHistory
+            self.todayScore = updatedHistory.last?.score ?? 0
+            self.isLoadingScore = false
+        }
     }
 }
 
@@ -288,6 +393,7 @@ struct HistoryView: View {
     @State private var isSyncing  = false
     @State private var lastSynced = ""
     @State private var history: [DayScore] = []
+    @State private var isLoadingScores = false
 
     private let abbrev: [String: String] = [
         "date":                   "Date",
@@ -475,7 +581,15 @@ struct HistoryView: View {
                     }
 
                     // ── Score Chart ──────────────────────────
-                    if history.count > 1 {
+                    if isLoadingScores {
+                        HStack(spacing: 8) {
+                            ProgressView().tint(Color(white: 0.5))
+                            Text("Loading scores…")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(Color(white: 0.35))
+                        }
+                        .padding(.vertical, 12)
+                    } else if history.count > 1 {
                         ScoreChartView(history: history)
                             .padding(.horizontal, 16)
                             .padding(.vertical, 12)
@@ -507,7 +621,7 @@ struct HistoryView: View {
         case "exercise_minutes":
             if let i = Int(value) { return "\(i)m" }
         case "mood":
-            return value  // number only
+            return value
         default: break
         }
         return value
@@ -543,7 +657,7 @@ struct HistoryView: View {
             lastSynced = fmt.string(from: modified)
         }
 
-        // Parse into DayScore for chart
+        // Parse into DayScore for chart — score = 0 until API responds
         let hdrs     = lines[0].components(separatedBy: ",")
         let dateIdx  = hdrs.firstIndex(of: "date")                   ?? 0
         let stepsIdx = hdrs.firstIndex(of: "steps")                  ?? 1
@@ -553,7 +667,7 @@ struct HistoryView: View {
         let moodIdx  = hdrs.firstIndex(of: "mood")
         let dateFmt  = DateFormatter(); dateFmt.dateFormat = "yyyy-MM-dd"
 
-        history = lines.dropFirst().compactMap { line -> DayScore? in
+        let parsed = lines.dropFirst().compactMap { line -> DayScore? in
             let cols = line.components(separatedBy: ",")
             guard cols.indices.contains(dateIdx),
                   let date = dateFmt.date(from: cols[dateIdx]) else { return nil }
@@ -562,10 +676,48 @@ struct HistoryView: View {
             let exercise = Int(cols[safe: exIdx] ?? "")       ?? 0
             let sleep    = Double(cols[safe: sleepIdx] ?? "") ?? 0
             let mood     = moodIdx.flatMap { Int(cols[safe: $0] ?? "") } ?? 0
-            let score    = computeScore(steps: steps, restingHR: hr, exerciseMinutes: exercise, sleepHours: sleep)
-            return DayScore(date: date, score: score, steps: steps, restingHR: hr,
+            // score = 0 as placeholder; API will replace it
+            return DayScore(date: date, score: 0, steps: steps, restingHR: hr,
                             exerciseMinutes: exercise, sleepHours: sleep, mood: mood)
         }.sorted { $0.date < $1.date }
+
+        history = parsed
+        isLoadingScores = true
+
+        var updatedHistory = parsed
+        let group = DispatchGroup()
+
+        for (i, day) in parsed.enumerated() {
+            group.enter()
+            fetchAPIScore(
+                steps:           day.steps,
+                restingHR:       day.restingHR,
+                exerciseMinutes: day.exerciseMinutes,
+                sleepHours:      day.sleepHours,
+                mood:            day.mood > 0 ? day.mood : 3
+            ) { apiScore in
+                guard let apiScore else {
+                    print("⚠️ API returned nil for history row \(i) — score stays 0")
+                    group.leave(); return
+                }
+                let updated = DayScore(
+                    date: day.date, score: apiScore,
+                    steps: day.steps, restingHR: day.restingHR,
+                    exerciseMinutes: day.exerciseMinutes,
+                    sleepHours: day.sleepHours, mood: day.mood
+                )
+                DispatchQueue.main.async {
+                    updatedHistory[i] = updated
+                    self.history = updatedHistory
+                }
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) {
+            self.history = updatedHistory
+            self.isLoadingScores = false
+        }
     }
 }
 
