@@ -32,6 +32,15 @@ final class HealthBridge {
         }
     }
 
+    /// Call this when the user taps Sync so the Health permission sheet appears (user-initiated = more reliable on device).
+    func ensureHealthAuthorization(completion: @escaping (Bool) -> Void) {
+        guard HKHealthStore.isHealthDataAvailable() else {
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+        requestPermissions(completion: completion)
+    }
+
     // ─────────────────────────────────────────
     // MARK: Entry point (daily ongoing use)
     // ─────────────────────────────────────────
@@ -52,7 +61,7 @@ final class HealthBridge {
     // Change daysBack to however far you want.
     // ─────────────────────────────────────────
 
-    func fetchHistory(daysBack: Int = 90) {
+    func fetchHistory(daysBack: Int = 90, completion: (() -> Void)? = nil) {
         guard HKHealthStore.isHealthDataAvailable() else { return }
         createCSVIfNeeded()
         requestPermissions { [weak self] granted in
@@ -67,14 +76,15 @@ final class HealthBridge {
             }
 
             print("[HealthBridge] Starting historical fetch for \(daysBack) days…")
-            self.fetchDaysSequentially(dates: dates, index: 0)
+            self.fetchDaysSequentially(dates: dates, index: 0, completion: completion)
         }
     }
 
     // Fetch one day at a time to avoid hammering HealthKit
-    private func fetchDaysSequentially(dates: [Date], index: Int) {
+    private func fetchDaysSequentially(dates: [Date], index: Int, completion: (() -> Void)? = nil) {
         guard index < dates.count else {
             print("[HealthBridge] ✅ Historical fetch complete!")
+            DispatchQueue.main.async { completion?() }
             return
         }
 
@@ -108,11 +118,10 @@ final class HealthBridge {
         }
 
         group.notify(queue: .global(qos: .utility)) { [weak self] in
-            guard let self else { return }
+            guard let self else { DispatchQueue.main.async { completion?() }; return }
             self.appendRow(date: dayStart, steps: steps, rhr: rhr,
                            exercise: exercise, sleep: sleep)
-            // Move to next day
-            self.fetchDaysSequentially(dates: dates, index: index + 1)
+            self.fetchDaysSequentially(dates: dates, index: index + 1, completion: completion)
         }
     }
 
@@ -120,7 +129,8 @@ final class HealthBridge {
     // MARK: Daily sync (ongoing)
     // ─────────────────────────────────────────
 
-    func syncToday(completion: (() -> Void)? = nil) {
+    /// Syncs today's health data to CSV. Optionally calls back with (steps, restingHR, exerciseMinutes, sleepHours) for API submission.
+    func syncToday(completion: ((Int, Double?, Int, Double) -> Void)? = nil) {
         let end   = Date()
         let start = Calendar.current.startOfDay(for: end)
         let group = DispatchGroup()
@@ -148,12 +158,61 @@ final class HealthBridge {
         }
 
         group.notify(queue: .global(qos: .utility)) { [weak self] in
-            guard let self else { completion?(); return }
+            guard let self else { completion?(steps, rhr, exercise, sleep); return }
             let today = Calendar.current.startOfDay(for: Date())
             self.appendRow(date: today, steps: steps, rhr: rhr,
                            exercise: exercise, sleep: sleep)
-            completion?()
+            completion?(steps, rhr, exercise, sleep)
         }
+    }
+
+    // ─────────────────────────────────────────
+    // MARK: Fetch a specific day from HealthKit
+    // ─────────────────────────────────────────
+
+    func fetchDay(date: Date, completion: @escaping (Int, Double?, Int, Double) -> Void) {
+        guard HKHealthStore.isHealthDataAvailable() else {
+            DispatchQueue.main.async { completion(0, nil, 0, 0) }
+            return
+        }
+        let dayStart = Calendar.current.startOfDay(for: date)
+        let dayEnd   = Calendar.current.date(byAdding: .day, value: 1, to: dayStart)!
+        let group    = DispatchGroup()
+
+        var steps:    Int     = 0
+        var rhr:      Double? = nil
+        var exercise: Int     = 0
+        var sleep:    Double  = 0
+
+        group.enter()
+        querySum(.stepCount, unit: .count(), start: dayStart, end: dayEnd) {
+            steps = Int($0 ?? 0); group.leave()
+        }
+        group.enter()
+        queryLatest(.restingHeartRate, unit: HKUnit(from: "count/min"), start: dayStart, end: dayEnd) {
+            rhr = $0; group.leave()
+        }
+        group.enter()
+        querySum(.appleExerciseTime, unit: .minute(), start: dayStart, end: dayEnd) {
+            exercise = Int($0 ?? 0); group.leave()
+        }
+        group.enter()
+        querySleepHours(start: dayStart, end: dayEnd) {
+            sleep = $0; group.leave()
+        }
+
+        group.notify(queue: .main) {
+            completion(steps, rhr, exercise, sleep)
+        }
+    }
+
+    // ─────────────────────────────────────────
+    // MARK: Save manually entered day to CSV
+    // ─────────────────────────────────────────
+
+    func saveDay(date: Date, steps: Int, rhr: Double?, exercise: Int, sleep: Double) {
+        createCSVIfNeeded()
+        appendRow(date: date, steps: steps, rhr: rhr, exercise: exercise, sleep: sleep)
     }
 
     // ─────────────────────────────────────────
@@ -172,7 +231,7 @@ final class HealthBridge {
             let query = HKObserverQuery(sampleType: type as! HKSampleType, predicate: nil) {
                 [weak self] _, completionHandler, error in
                 guard error == nil else { completionHandler(); return }
-                self?.syncToday { completionHandler() }
+                self?.syncToday { _, _, _, _ in completionHandler() }
             }
             store.execute(query)
         }

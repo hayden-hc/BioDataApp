@@ -218,6 +218,37 @@ class HealthScoreModel:
 
         return self._compute_score(entry)
 
+    def replace_day(
+        self,
+        day_index: int,
+        steps: float,
+        exercise_minutes: float,
+        sleep_hours: float,
+        mood: float,
+        resting_hr: Optional[float] = None,
+    ) -> ScoreResult:
+        """
+        Replace the entry at day_index (1-based) instead of appending.
+        Recomputes weights and returns score for that day. Use when the client
+        is updating an existing day (e.g. re-save or refresh).
+        """
+        if day_index < 1 or day_index > len(self.history):
+            raise ValueError(f"day_index must be 1..{len(self.history)}, got {day_index}")
+        idx = day_index - 1
+        sleep_quality = max(0.0, 1.0 - abs(sleep_hours - 8.0) / 4.0)
+        entry = DailyEntry(
+            day          = day_index,
+            steps        = steps,
+            exercise_min = exercise_minutes,
+            sleep_hours  = sleep_hours,
+            mood         = mood,
+            resting_hr   = resting_hr,
+            sleep_quality= sleep_quality,
+        )
+        self.history[idx] = entry
+        self._update_weights()
+        return self._compute_score(entry, replace_index=idx)
+
     # ── Scoring ──────────────────────────────────────────────────────────────
 
     def _get_baseline(self) -> tuple[dict, dict, str]:
@@ -301,18 +332,9 @@ class HealthScoreModel:
 
         # Dynamic weight: absolute score (0–100) → benchmark weight (e.g. 99 → 0.99), clipped
         w_abs = np.clip(abs_s / 100.0, ABSOLUTE_WEIGHT_MIN, ABSOLUTE_WEIGHT_MAX)
-
-        # If the clinical absolute score is noticeably higher than the personal score
-        # (i.e. the user's baseline is already healthy), bias the blend further toward
-        # the absolute score so personal-day noise doesn't drag a healthy benchmark down.
-        if abs_s > per_s and abs_s >= 70.0:
-            delta = abs_s - per_s
-            boost = (delta / 100.0) * 0.5  # up to +0.5 weight toward absolute
-            w_abs = np.clip(w_abs + boost, ABSOLUTE_WEIGHT_MIN, ABSOLUTE_WEIGHT_MAX)
-
         return w_abs * abs_s + (1 - w_abs) * per_s
 
-    def _compute_score(self, entry: DailyEntry) -> ScoreResult:
+    def _compute_score(self, entry: DailyEntry, replace_index: Optional[int] = None) -> ScoreResult:
         means, stds, source = self._get_baseline()
 
         raw = {
@@ -348,16 +370,29 @@ class HealthScoreModel:
             (self.category_weights[c] / active_weight) * s for c, s in active_cats.items()
         )
 
-        # 3-day EMA smoothing
-        self.score_history.append(raw_score)
-        n = len(self.score_history)
-        if n >= 3:
-            w = SCORE_EMA_WEIGHTS
-            smoothed = w[0]*self.score_history[-1] + w[1]*self.score_history[-2] + w[2]*self.score_history[-3]
-        elif n == 2:
-            smoothed = 0.65 * self.score_history[-1] + 0.35 * self.score_history[-2]
+        # 3-day EMA smoothing: replace existing day or append new
+        if replace_index is not None:
+            self.score_history[replace_index] = raw_score
+            # Smoothed for this day uses the window ending at replace_index
+            idx = replace_index
+            n = len(self.score_history)
+            if idx >= 2:
+                w = SCORE_EMA_WEIGHTS
+                smoothed = w[0]*self.score_history[idx] + w[1]*self.score_history[idx-1] + w[2]*self.score_history[idx-2]
+            elif idx == 1 and n >= 2:
+                smoothed = 0.65 * self.score_history[1] + 0.35 * self.score_history[0]
+            else:
+                smoothed = self.score_history[0]
         else:
-            smoothed = raw_score
+            self.score_history.append(raw_score)
+            n = len(self.score_history)
+            if n >= 3:
+                w = SCORE_EMA_WEIGHTS
+                smoothed = w[0]*self.score_history[-1] + w[1]*self.score_history[-2] + w[2]*self.score_history[-3]
+            elif n == 2:
+                smoothed = 0.65 * self.score_history[-1] + 0.35 * self.score_history[-2]
+            else:
+                smoothed = raw_score
 
         return ScoreResult(
             score          = round(smoothed, 1),

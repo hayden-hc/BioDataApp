@@ -3,12 +3,13 @@ Health Score Tester — web UI
 Run this file, then open http://localhost:8080 in your browser (or the Network URL printed on startup for LAN access).
 """
 
-import sys, json, traceback
+import sys, json, traceback, os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 import webbrowser, threading, socket
 
-sys.path.insert(0, '/Users/nicholaske/Desktop/CS31/health app')
+# Use project root so "import health_score_model" works when run from this repo
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import health_score_model as hsm
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -65,14 +66,8 @@ HTML = """<!DOCTYPE html>
 
     <div class="section">
       <h3>PROFILE</h3>
-      <label><span>Height</span>
-        <input type="number" id="height" value="172.7" step="0.1" style="width:80px">
-        <select id="height_unit"><option value="cm">cm</option><option value="in">in</option></select>
-      </label>
-      <label><span>Weight</span>
-        <input type="number" id="weight" value="68.0" step="0.1" style="width:80px">
-        <select id="weight_unit"><option value="kg">kg</option><option value="lb">lb</option></select>
-      </label>
+      <label><span>Height (cm)</span><input type="number" id="height" value="172.7" step="0.1"></label>
+      <label><span>Weight (kg)</span><input type="number" id="weight" value="68.0" step="0.1"></label>
       <label><span>Age</span><input type="number" id="age" value="18"></label>
       <label><span>Gender</span>
         <select id="gender"><option value="male">Male</option><option value="female">Female</option></select>
@@ -120,21 +115,12 @@ function setStatus(msg, err=false) {
 }
 
 async function doReset() {
-  // Convert height/weight to cm/kg before sending (server expects SI units)
-  const rawHeight = parseFloat(val('height'));
-  const heightUnit = val('height_unit');
-  const heightCm = (heightUnit === 'in') ? (rawHeight * 2.54) : rawHeight;
-
-  const rawWeight = parseFloat(val('weight'));
-  const weightUnit = val('weight_unit');
-  const weightKg = (weightUnit === 'lb') ? (rawWeight * 0.45359237) : rawWeight;
-
   const res = await fetch('/reset', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({
-      height: heightCm,
-      weight: weightKg,
+      height: parseFloat(val('height')),
+      weight: parseFloat(val('weight')),
       age: parseInt(val('age')),
       gender: val('gender')
     })
@@ -172,11 +158,6 @@ function doDefaults() {
   document.getElementById('rhr').value      = 55;
   document.getElementById('mood').value     = 7;
   document.getElementById('mood_val').textContent = 7;
-  // keep profile defaults in SI units
-  document.getElementById('height').value = 172.7;
-  document.getElementById('height_unit').value = 'cm';
-  document.getElementById('weight').value = 68.0;
-  document.getElementById('weight_unit').value = 'kg';
 }
 
 function addToHistory(day, score, index) {
