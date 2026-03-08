@@ -117,6 +117,32 @@ def score():
 
 
 # ─────────────────────────────────────────────
+# POST /goals — return current target (goal) values for spider chart
+# Body: { "user_id": "...", "profile": { "height_cm", "weight_kg", "gender", "age" } }
+# Returns: { "goals": { "steps", "exercise_min", "sleep_hours", "resting_hr", "mood" } }
+# ─────────────────────────────────────────────
+
+@app.route("/goals", methods=["POST"])
+def goals():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "No JSON body"}), 400
+    for key in ["user_id", "profile"]:
+        if key not in data:
+            return jsonify({"error": f"Missing field: {key}"}), 400
+    profile = data["profile"]
+    for key in ["height_cm", "weight_kg", "gender", "age"]:
+        if key not in profile:
+            return jsonify({"error": f"Missing profile field: {key}"}), 400
+    try:
+        model = get_or_create_model(data["user_id"], profile)
+        goals_dict = model.get_goals()
+        return jsonify({"goals": goals_dict})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────
 # GET /history/<user_id>
 # Returns all daily scores logged so far
 # ─────────────────────────────────────────────

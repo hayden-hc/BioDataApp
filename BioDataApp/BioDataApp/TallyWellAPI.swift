@@ -59,6 +59,19 @@ struct HistoryResponse: Decodable {
     let days: [HistoryDay]
 }
 
+/// Goals (targets) for spider chart — from model baseline, shift with profile/history.
+struct SpiderGoals: Decodable {
+    let steps: Double
+    let exercise_min: Double
+    let sleep_hours: Double
+    let resting_hr: Double
+    let mood: Double
+}
+
+struct GoalsResponse: Decodable {
+    let goals: SpiderGoals
+}
+
 // MARK: - API errors
 
 enum APIError: Error {
@@ -179,6 +192,33 @@ final class TallyWellAPI {
         } catch {
             throw APIError.decoding(error.localizedDescription)
         }
+    }
+
+    // MARK: POST /goals (spider chart targets from model)
+
+    func fetchGoals(profile: Profile) async throws -> SpiderGoals {
+        guard let url = URL(string: "\(requestBaseURL)/goals") else { throw APIError.invalidURL }
+        let body: [String: Any] = [
+            "user_id": userId,
+            "profile": [
+                "height_cm": profile.height_cm,
+                "weight_kg": profile.weight_kg,
+                "gender": profile.gender,
+                "age": profile.age
+            ]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: body)
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        request.timeoutInterval = 20
+        let (responseData, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw APIError.server(String(data: responseData, encoding: .utf8) ?? "Goals failed")
+        }
+        let decoded = try JSONDecoder().decode(GoalsResponse.self, from: responseData)
+        return decoded.goals
     }
 
     // MARK: GET /health (connection test)

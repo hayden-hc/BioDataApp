@@ -126,6 +126,13 @@ ABSOLUTE_WEIGHT_MIN    = 0.05  # floor so personal always matters a bit
 ABSOLUTE_WEIGHT_MAX    = 0.95  # cap so absolute never fully overrides personal
 SIGMOID_DAMPING        = 2.0   # widens sigmoid to reduce day-to-day variability
 SCORE_EMA_WEIGHTS      = [0.50, 0.30, 0.20]  # most-recent to oldest (3-day EMA)
+MIN_DAYS_FOR_REGRESSION = 5    # minimum history to fit mood ~ metrics linear model
+REGRESSION_FEATURES    = ["steps", "exercise_min", "sleep_hours", "sleep_quality", "resting_hr"]
+# Bayesian linear regression: prior beta ~ N(0, 1/LAMBDA), likelihood variance SIGMA_SQ
+BAYES_PRIOR_PRECISION  = 0.5   # lambda (weak prior; smaller = more regularization)
+BAYES_LIKELIHOOD_VAR    = 2.0   # sigma^2 for mood (0–10 scale)
+BAYES_INTERCEPT_PRIOR_MEAN = 5.0
+BAYES_INTERCEPT_PRIOR_VAR  = 25.0  # large so data dominate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -303,6 +310,20 @@ class HealthScoreModel:
 
         return means, stds, "personal"
 
+    def get_goals(self) -> dict:
+        """
+        Return current target (goal) values for spider chart / dashboard.
+        Uses model baseline (national or personal). Mood target fixed at 7.5 (0–10 scale).
+        """
+        means, _, _ = self._get_baseline()
+        return {
+            "steps": means["steps"],
+            "exercise_min": means["exercise_min"],
+            "sleep_hours": means["sleep_hours"],
+            "resting_hr": means["resting_hr"],
+            "mood": 7.5,
+        }
+
     def _absolute_score(self, metric: str, value: float) -> float:
         """Score based on fixed clinical health zones (0–100)."""
         zone = CLINICAL_ZONES.get(metric)
@@ -358,6 +379,95 @@ class HealthScoreModel:
         w_abs = np.clip(abs_s / 100.0, ABSOLUTE_WEIGHT_MIN, ABSOLUTE_WEIGHT_MAX)
         return w_abs * abs_s + (1 - w_abs) * per_s
 
+    # ── Design matrix for mood ~ metrics (shared by OLS and Bayesian) ────────
+
+    def _build_mood_design(
+        self, means: dict, stds: dict, exclude_index: Optional[int] = None
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Build X (n x 5) and y (n,) for mood regression. Returns (X, y) or (None, None)."""
+        indices = [i for i in range(len(self.history)) if i != exclude_index]
+        if len(indices) < MIN_DAYS_FOR_REGRESSION:
+            return None, None
+        X_rows = []
+        y_list = []
+        for i in indices:
+            e = self.history[i]
+            rhr = e.resting_hr if e.resting_hr is not None else means["resting_hr"]
+            row = [
+                (e.steps - means["steps"]) / (stds["steps"] + 1e-6),
+                (e.exercise_min - means["exercise_min"]) / (stds["exercise_min"] + 1e-6),
+                (e.sleep_hours - means["sleep_hours"]) / (stds["sleep_hours"] + 1e-6),
+                (e.sleep_quality - means["sleep_quality"]) / (stds["sleep_quality"] + 1e-6),
+                (rhr - means["resting_hr"]) / (stds["resting_hr"] + 1e-6),
+            ]
+            X_rows.append(row)
+            y_list.append(e.mood)
+        return np.array(X_rows, dtype=float), np.array(y_list, dtype=float)
+
+    # ── Bayesian linear regression: posterior over beta (ML + Bayesian) ──────
+
+    def _bayesian_mood_posterior(
+        self, X: np.ndarray, y: np.ndarray
+    ) -> Tuple[np.ndarray, float, Optional[np.ndarray]]:
+        """
+        Bayesian linear regression: mood = X @ beta + b0 + noise, noise ~ N(0, sigma^2).
+        Prior: beta ~ N(0, 1/lambda I), b0 ~ N(prior_mean, prior_var).
+        Returns (post_mean_beta, post_intercept, post_cov_beta).
+        """
+        n, p = X.shape
+        X_aug = np.hstack([X, np.ones((n, 1))])
+        sigma_sq = BAYES_LIKELIHOOD_VAR
+        lambda_prior = BAYES_PRIOR_PRECISION
+        prior_mean_theta = np.zeros(p + 1)
+        prior_mean_theta[-1] = BAYES_INTERCEPT_PRIOR_MEAN
+        prior_precision = np.eye(p + 1) * lambda_prior
+        prior_precision[-1, -1] = 1.0 / BAYES_INTERCEPT_PRIOR_VAR
+        post_precision = prior_precision + (X_aug.T @ X_aug) / sigma_sq
+        try:
+            post_cov_theta = np.linalg.inv(post_precision)
+        except np.linalg.LinAlgError:
+            post_cov_theta = np.eye(p + 1) * (1.0 / lambda_prior)
+        post_mean_theta = post_cov_theta @ (prior_precision @ prior_mean_theta + X_aug.T @ y / sigma_sq)
+        beta_mean = post_mean_theta[:-1]
+        intercept = float(post_mean_theta[-1])
+        beta_cov = post_cov_theta[:-1, :-1]
+        return beta_mean, intercept, beta_cov
+
+    def _fit_mood_regression(
+        self, means: dict, stds: dict, exclude_index: Optional[int] = None, use_bayesian: bool = True
+    ) -> Tuple[Optional[np.ndarray], Optional[float]]:
+        """
+        Fit mood = beta @ x + intercept. When use_bayesian=True (default), uses posterior mean
+        from Bayesian linear regression; otherwise OLS. Returns (beta, intercept) or (None, None).
+        """
+        X, y = self._build_mood_design(means, stds, exclude_index)
+        if X is None or y is None:
+            return None, None
+        try:
+            if use_bayesian:
+                beta, intercept, _ = self._bayesian_mood_posterior(X, y)
+                return beta, intercept
+            X_aug = np.hstack([X, np.ones((len(X), 1))])
+            coeffs, *_ = np.linalg.lstsq(X_aug, y, rcond=None)
+            return coeffs[:-1], float(coeffs[-1])
+        except Exception:
+            return None, None
+
+    def _predict_mood_from_metrics(
+        self, entry: DailyEntry, means: dict, stds: dict, beta: np.ndarray, intercept: float
+    ) -> float:
+        """Predict mood (0–10) from today's metrics using learned coefficients."""
+        rhr = entry.resting_hr if entry.resting_hr is not None else means["resting_hr"]
+        x = np.array([
+            (entry.steps - means["steps"]) / (stds["steps"] + 1e-6),
+            (entry.exercise_min - means["exercise_min"]) / (stds["exercise_min"] + 1e-6),
+            (entry.sleep_hours - means["sleep_hours"]) / (stds["sleep_hours"] + 1e-6),
+            (entry.sleep_quality - means["sleep_quality"]) / (stds["sleep_quality"] + 1e-6),
+            (rhr - means["resting_hr"]) / (stds["resting_hr"] + 1e-6),
+        ], dtype=float)
+        pred = float(np.dot(x, beta) + intercept)
+        return float(np.clip(pred, 0.0, 10.0))
+
     def _compute_score(self, entry: DailyEntry, replace_index: Optional[int] = None) -> ScoreResult:
         means, stds, source = self._get_baseline()
 
@@ -372,7 +482,7 @@ class HealthScoreModel:
         if entry.resting_hr is not None:
             raw["resting_hr"] = self._blend_score("resting_hr", entry.resting_hr, means["resting_hr"], stds["resting_hr"], -1)
 
-        # Category scores
+        # Category scores (always computed for breakdown and recommendations)
         category_totals     = {c: 0.0 for c in BASE_CATEGORY_WEIGHTS}
         category_weight_sum = {c: 0.0 for c in BASE_CATEGORY_WEIGHTS}
 
@@ -387,12 +497,17 @@ class HealthScoreModel:
             for c in BASE_CATEGORY_WEIGHTS
         }
 
-        # Exclude categories that had no contributing metrics (e.g. stability placeholder)
-        active_cats   = {c: s for c, s in category_scores.items() if category_weight_sum[c] > 0}
-        active_weight = sum(self.category_weights[c] for c in active_cats)
-        raw_score = sum(
-            (self.category_weights[c] / active_weight) * s for c, s in active_cats.items()
-        )
+        # Raw score: use linear regression (mood ~ metrics) when enough history, else rule-based
+        beta, intercept = self._fit_mood_regression(means, stds, exclude_index=replace_index)
+        if beta is not None and intercept is not None:
+            pred_mood = self._predict_mood_from_metrics(entry, means, stds, beta, intercept)
+            raw_score = float(np.clip(pred_mood * 10.0, 0.0, 100.0))
+        else:
+            active_cats   = {c: s for c, s in category_scores.items() if category_weight_sum[c] > 0}
+            active_weight = sum(self.category_weights[c] for c in active_cats)
+            raw_score = sum(
+                (self.category_weights[c] / active_weight) * s for c, s in active_cats.items()
+            )
 
         # 3-day EMA smoothing: replace existing day or append new
         if replace_index is not None:
@@ -429,17 +544,49 @@ class HealthScoreModel:
             baseline_source= source,
         )
 
-    # ── Weight personalisation ────────────────────────────────────────────────
+    # ── Weight personalisation (Bayesian when enough data, else correlation) ──
 
     def _update_weights(self):
         """
-        Correlate each metric's deviation from baseline with mood.
-        Metrics that co-vary with the user's own mood get higher weight.
+        Update metric weights from data. With enough history, uses Bayesian linear regression
+        posterior: weights are derived from |beta| (how much each metric predicts mood), then
+        blended with the prior (base weights). With little data, falls back to correlation-based
+        heuristic.
         """
         means, stds, _ = self._get_baseline()
-        metrics = ["sleep_hours", "sleep_quality", "steps", "exercise_min", "resting_hr"]
-        moods   = np.array([e.mood for e in self.history])
+        metrics = ["steps", "exercise_min", "sleep_hours", "sleep_quality", "resting_hr"]
+        base_weights = {k: BASE_METRIC_WEIGHTS[k][1] for k in metrics}
+        alpha = MOOD_BLEND_MAX * (1 - np.exp(-len(self.history) / 30.0))
 
+        if len(self.history) >= MIN_DAYS_FOR_REGRESSION:
+            X, y = self._build_mood_design(means, stds, exclude_index=None)
+            if X is not None and y is not None:
+                try:
+                    beta, _, _ = self._bayesian_mood_posterior(X, y)
+                    coef_abs = np.abs(beta) + 1e-6
+                    learned = {
+                        "steps":         float(coef_abs[0]),
+                        "exercise_min":  float(coef_abs[1]),
+                        "sleep_hours":   float(coef_abs[2]),
+                        "sleep_quality":  float(coef_abs[3]),
+                        "resting_hr":    float(coef_abs[4]),
+                    }
+                    for cat in BASE_CATEGORY_WEIGHTS:
+                        cat_metrics = [m for m in metrics if BASE_METRIC_WEIGHTS[m][0] == cat]
+                        total = sum(learned[m] for m in cat_metrics)
+                        if total > 0:
+                            for m in cat_metrics:
+                                w_learned = learned[m] / total
+                                self.metric_weights[m] = (1 - alpha) * base_weights[m] + alpha * w_learned
+                        else:
+                            for m in cat_metrics:
+                                self.metric_weights[m] = base_weights[m]
+                    return
+                except Exception:
+                    pass
+
+        # Fallback: correlation-based (original heuristic)
+        moods = np.array([e.mood for e in self.history])
         correlations = {}
         for m in metrics:
             if m == "resting_hr":
@@ -448,32 +595,20 @@ class HealthScoreModel:
             else:
                 values  = np.array([getattr(e, m) for e in self.history])
                 m_moods = moods
-
             if len(values) < 2 or np.std(values) < 1e-6 or np.std(m_moods) < 1e-6:
                 correlations[m] = 0.0
                 continue
-
             mean_v = means.get(m, float(np.mean(values)))
             std_v  = stds.get(m, 1.0)
             deviations = (values - mean_v) / (std_v + 1e-6)
-            # RHR: invert deviations so lower = positive signal
             if m == "resting_hr":
                 deviations = -deviations
-
             r = float(np.corrcoef(deviations, m_moods)[0, 1])
             correlations[m] = max(0.0, r)
-
-        # Exponential growth: small on day 1 (~2%), meaningful by day 14 (~17%), near-max by day 90 (~43%)
-        alpha = MOOD_BLEND_MAX * (1 - np.exp(-len(self.history) / 30.0))
-
-        base_weights = {k: BASE_METRIC_WEIGHTS[k][1] for k in metrics}
-        corr_total   = sum(correlations.values()) + 1e-6
-        corr_norm    = {k: v / corr_total for k, v in correlations.items()}
-
+        corr_total = sum(correlations.values()) + 1e-6
+        corr_norm  = {k: v / corr_total for k, v in correlations.items()}
         for m in metrics:
             self.metric_weights[m] = (1 - alpha) * base_weights[m] + alpha * corr_norm[m]
-
-        # Renormalise within each category
         for cat in BASE_CATEGORY_WEIGHTS:
             cat_metrics = [m for m in metrics if BASE_METRIC_WEIGHTS[m][0] == cat]
             total = sum(self.metric_weights[m] for m in cat_metrics)
