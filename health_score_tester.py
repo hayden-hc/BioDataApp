@@ -324,7 +324,8 @@ def result_to_dict(inp, r, index):
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    PORT = 8080
+    import os
+    PORT = int(os.environ.get('PORT', 8080))
     server = HTTPServer(('0.0.0.0', PORT), Handler)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

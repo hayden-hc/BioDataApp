@@ -9,10 +9,11 @@ Output         : score, per-metric breakdown, personalised weight recommendation
 
 Scoring approach:
   Each metric is scored as a blend of:
-    - Absolute score  (40%): where the value sits on a fixed clinical health scale
-    - Personal score  (60%): deviation from the user's own rolling baseline
-  This ensures objectively healthy values are always rewarded, while also
-  recognising when a user is above or below their own norm.
+    - Absolute score (health benchmark): where the value sits on a fixed clinical scale
+    - Personal score: deviation from the user's own rolling baseline
+  The blend is dynamic: the health-benchmark score sets its own weight (e.g. 99 → 99%
+  benchmark, 1% personal), so near-perfect benchmark dominates; lower benchmark
+  means personal progress matters more.
   The final displayed score is a 3-day EMA to reduce day-to-day noise.
   Mood correlations shift metric weights over time to personalise.
 """
@@ -118,7 +119,9 @@ BASE_METRIC_WEIGHTS = {
 BASELINE_WINDOW        = 14    # days before switching from national → personal baseline
 MIN_DAYS_FOR_WEIGHT_UPDATE = 1
 MOOD_BLEND_MAX         = 0.45
-ABSOLUTE_WEIGHT        = 0.40  # blend: 40% clinical zone, 60% personal baseline
+# Dynamic blend: health-benchmark (absolute) score sets its own weight (e.g. 99 → 99% absolute, 1% personal)
+ABSOLUTE_WEIGHT_MIN    = 0.05  # floor so personal always matters a bit
+ABSOLUTE_WEIGHT_MAX    = 0.95  # cap so absolute never fully overrides personal
 SIGMOID_DAMPING        = 2.0   # widens sigmoid to reduce day-to-day variability
 SCORE_EMA_WEIGHTS      = [0.50, 0.30, 0.20]  # most-recent to oldest (3-day EMA)
 
@@ -281,9 +284,10 @@ class HealthScoreModel:
 
     def _blend_score(self, metric: str, value: float, mean: float, std: float, direction: int = 1) -> float:
         """
-        Blend absolute clinical score (40%) + mood-optimal personal score (60%).
-        Personal target starts at the population/personal baseline mean and shifts
-        toward the user's mood-optimal value as mood data accumulates.
+        Blend absolute clinical score + mood-optimal personal score.
+        The health-benchmark (absolute) score sets its own weight: e.g. 99 → 99% absolute,
+        1% personal (near-perfect benchmark dominates); low absolute → personal matters more.
+        Personal target starts at baseline mean and shifts toward mood-optimal as data accumulates.
         """
         abs_s = self._absolute_score(metric, value)
 
@@ -292,7 +296,10 @@ class HealthScoreModel:
         target    = (1 - alpha) * mean + alpha * mood_opt if mood_opt is not None else mean
 
         per_s = self._personal_score(value, target, std, direction)
-        return ABSOLUTE_WEIGHT * abs_s + (1 - ABSOLUTE_WEIGHT) * per_s
+
+        # Dynamic weight: absolute score (0–100) → benchmark weight (e.g. 99 → 0.99), clipped
+        w_abs = np.clip(abs_s / 100.0, ABSOLUTE_WEIGHT_MIN, ABSOLUTE_WEIGHT_MAX)
+        return w_abs * abs_s + (1 - w_abs) * per_s
 
     def _compute_score(self, entry: DailyEntry) -> ScoreResult:
         means, stds, source = self._get_baseline()
