@@ -265,13 +265,12 @@ struct SyncView: View {
     // ── Helpers ────────────────────────────────
 
     private func refresh() {
-        let loaded = loadCSVHistoryReturning()
+        loadCSVHistoryReturning()
         loadFromCSV()
-        autoScore(usingHistory: loaded)
+        autoScore()
     }
 
-    /// Pass `usingHistory` when you just loaded CSV so day_index is computed from fresh data (SwiftUI state may not have updated yet).
-    private func autoScore(usingHistory: [DayScore]? = nil) {
+    private func autoScore() {
         let s   = Int(steps) ?? 0
         let ex  = Int(exerciseMinutes) ?? 0
         let sl  = Double(sleepHours) ?? 0
@@ -280,10 +279,10 @@ struct SyncView: View {
         score = computeScore(steps: s, restingHR: Int(rhr ?? 0), exerciseMinutes: ex, sleepHours: sl)
 
         guard AppSettings.hasProfile, s > 0 || ex > 0 || sl > 0 else { return }
-        // Use explicitly passed history so day_index is correct when we just called loadCSVHistory (state may not have updated yet).
-        let historyForIndex = usingHistory ?? history
-        let dayIndex: Int? = historyForIndex.firstIndex(where: { Calendar.current.isDate($0.date, inSameDayAs: selectedDate) }).map { $0 + 1 }
-        let req        = ScoreRequest(
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        let dateStr = df.string(from: selectedDate)
+        let req     = ScoreRequest(
             userId:          TallyWellAPI.shared.userId,
             profile:         AppSettings.profile,
             steps:           Double(s),
@@ -291,7 +290,7 @@ struct SyncView: View {
             sleepHours:      sl,
             mood:            mood,
             restingHr:       rhr,
-            dayIndex:        dayIndex
+            date:            dateStr
         )
         let targetDate = selectedDate
         Task.detached(priority: .background) {
@@ -386,8 +385,8 @@ struct SyncView: View {
         let sl  = Double(sleepHours) ?? 0
         let rhr = restingHR.isEmpty ? nil : Double(restingHR)
         HealthBridge.shared.saveDay(date: selectedDate, steps: s, rhr: rhr, exercise: ex, sleep: sl)
-        let loaded = loadCSVHistoryReturning()
-        autoScore(usingHistory: loaded)
+        loadCSVHistoryReturning()
+        autoScore()
     }
 
     /// Fetch the selected day from HealthKit and overwrite form + CSV (then refresh score).
@@ -400,8 +399,8 @@ struct SyncView: View {
                 sleepHours      = String(format: "%.2f", sl)
                 restingHR       = rhr.map { String(format: "%.0f", $0) } ?? ""
                 HealthBridge.shared.saveDay(date: selectedDate, steps: s, rhr: rhr, exercise: ex, sleep: sl)
-                let loaded = loadCSVHistoryReturning()
-                autoScore(usingHistory: loaded)
+                loadCSVHistoryReturning()
+                autoScore()
             }
         }
     }

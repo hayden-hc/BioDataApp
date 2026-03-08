@@ -17,8 +17,8 @@ struct ScoreRequest {
     let sleepHours: Double
     let mood: Double
     let restingHr: Double?
-    /// When set, API replaces this day (1-based) instead of appending. Use when saving/refreshing an existing day.
-    let dayIndex: Int?
+    /// Date for this day in "yyyy-MM-dd". When set, API replaces that date if it exists, else appends.
+    let date: String?
 }
 
 struct Profile: Codable {
@@ -143,8 +143,8 @@ final class TallyWellAPI {
         if let rhr = req.restingHr, rhr > 0 {
             body["resting_hr"] = rhr
         }
-        if let dayIndex = req.dayIndex {
-            body["day_index"] = dayIndex
+        if let date = req.date, !date.isEmpty {
+            body["date"] = date
         }
 
         var data: Data

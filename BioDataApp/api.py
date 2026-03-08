@@ -56,7 +56,7 @@ def get_or_create_model(user_id: str, profile: dict) -> HealthScoreModel:
 #   "sleep_hours": 7.2,
 #   "resting_hr": 61.0,    ← optional
 #   "mood": 7,             ← 0–10
-#   "day_index": 2         ← optional; 1-based; replace that day instead of appending (avoids re-adjusting weights)
+#   "date": "2026-03-07"   ← optional; if this date already exists, replace that day; else append
 # }
 #
 # Returns:
@@ -92,34 +92,15 @@ def score():
 
     try:
         model = get_or_create_model(data["user_id"], profile)
-        day_index = data.get("day_index")  # optional: 1-based; replace that day instead of appending
-        if day_index is not None:
-            day_index = int(day_index)
-            if 1 <= day_index <= len(model.history):
-                result = model.replace_day(
-                    day_index       = day_index,
-                    steps           = float(data["steps"]),
-                    exercise_minutes= float(data["exercise_minutes"]),
-                    sleep_hours     = float(data["sleep_hours"]),
-                    mood            = float(data["mood"]),
-                    resting_hr      = float(data["resting_hr"]) if data.get("resting_hr") else None,
-                )
-            else:
-                result = model.log_day(
-                    steps            = float(data["steps"]),
-                    exercise_minutes = float(data["exercise_minutes"]),
-                    sleep_hours      = float(data["sleep_hours"]),
-                    mood             = float(data["mood"]),
-                    resting_hr       = float(data["resting_hr"]) if data.get("resting_hr") else None,
-                )
-        else:
-            result = model.log_day(
-                steps            = float(data["steps"]),
-                exercise_minutes = float(data["exercise_minutes"]),
-                sleep_hours      = float(data["sleep_hours"]),
-                mood             = float(data["mood"]),
-                resting_hr       = float(data["resting_hr"]) if data.get("resting_hr") else None,
-            )
+        date = data.get("date")  # optional "YYYY-MM-DD"; if present and that date exists, replace; else append
+        result = model.log_day(
+            steps            = float(data["steps"]),
+            exercise_minutes = float(data["exercise_minutes"]),
+            sleep_hours      = float(data["sleep_hours"]),
+            mood             = float(data["mood"]),
+            resting_hr       = float(data["resting_hr"]) if data.get("resting_hr") else None,
+            date            = date,
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

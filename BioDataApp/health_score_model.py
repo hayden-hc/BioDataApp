@@ -141,6 +141,7 @@ class DailyEntry:
     mood: float                        # 0–10
     resting_hr: Optional[float] = None
     sleep_quality: float = 0.0         # derived: distance from 8-hr target, 0–1
+    date: Optional[str] = None         # "YYYY-MM-DD" for replace-by-date; None for legacy
 
 
 @dataclass
@@ -196,12 +197,36 @@ class HealthScoreModel:
         sleep_hours: float,
         mood: float,
         resting_hr: Optional[float] = None,
+        date: Optional[str] = None,
     ) -> ScoreResult:
         """
-        Record a day's metrics and return today's score + recommendations.
-        Call once per day in chronological order.
+        Record a day's metrics and return score + recommendations.
+        If date (YYYY-MM-DD) is provided and that date already exists in history, replace that day.
+        Otherwise append (new day). Keeps weights stable when the client re-sends the same day.
         """
         sleep_quality = max(0.0, 1.0 - abs(sleep_hours - 8.0) / 4.0)
+
+        existing_idx: Optional[int] = None
+        if date:
+            for i, e in enumerate(self.history):
+                if e.date == date:
+                    existing_idx = i
+                    break
+
+        if existing_idx is not None:
+            entry = DailyEntry(
+                day          = existing_idx + 1,
+                steps        = steps,
+                exercise_min = exercise_minutes,
+                sleep_hours  = sleep_hours,
+                mood         = mood,
+                resting_hr   = resting_hr,
+                sleep_quality= sleep_quality,
+                date         = date,
+            )
+            self.history[existing_idx] = entry
+            self._update_weights()
+            return self._compute_score(entry, replace_index=existing_idx)
 
         entry = DailyEntry(
             day          = len(self.history) + 1,
@@ -211,11 +236,10 @@ class HealthScoreModel:
             mood         = mood,
             resting_hr   = resting_hr,
             sleep_quality= sleep_quality,
+            date         = date,
         )
         self.history.append(entry)
-
         self._update_weights()
-
         return self._compute_score(entry)
 
     def replace_day(
